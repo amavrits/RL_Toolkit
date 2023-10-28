@@ -2,12 +2,13 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-class TabularQ:
+class TabularQLearning:
 
     def __init__(self, env, gamma, alpha_fn, eps_fn):
 
         self.env = env
         self.n_states = self.env.state_mesh.shape[0]
+        self.state_size = self.env.state_mesh.shape[1]
         self.n_actions = self.env.action_space.n
 
         self.gamma = gamma
@@ -44,21 +45,15 @@ class TabularQ:
         new_value = (1 - self.alpha) * old_value + self.alpha * (reward + self.gamma * next_value)
         self.Qtable[state_idx, action] = new_value
 
-    def get_Qtable(self):
-        return self.Qtable
-
-    def get_visits(self):
-        return self.visits
-
-    def QLearning(self, n_episodes=1_000):
+    def train(self, n_episodes=1_000):
 
         self.reset_Qtable()
         self.reset_visits()
         self.eps = self.eps_fn(0)
 
-        for t in tqdm(range(1, n_episodes + 1)):
+        for i_episode in tqdm(range(1, n_episodes + 1)):
 
-            self.eps = self.eps_fn(t)
+            self.eps = self.eps_fn(i_episode)
 
             state, _ = self.env.reset()
 
@@ -68,7 +63,7 @@ class TabularQ:
 
                 state_idx = self.env.get_observation_idx(state)
 
-                self.alpha = self.alpha_fn(t, state_idx)
+                self.alpha = self.alpha_fn(state)
 
                 action = self.pick_action(state_idx)
 
@@ -84,3 +79,38 @@ class TabularQ:
 
                 state = next_state
 
+        self.get_optimal_values()
+        self.get_optimal_policy()
+
+    def get_Qtable(self):
+        return self.Qtable
+
+    def get_visits(self):
+        return self.visits
+
+    def get_optimal_values(self):
+        self.optimal_values = np.max(self.Qtable, axis=1)
+
+    def get_optimal_policy(self):
+        self.optimal_policy = np.argmax(self.Qtable, axis=1)
+
+    def get_optimal_action(self, state):
+        state_idx = self.env.get_observation_idx(state)
+        return self.optimal_policy[state_idx]
+
+    def get_policy_df(self, state_columns):
+        df = pd.DataFrame(
+            data=np.c_[self.env.state_mesh, self.optimal_policy, self.optimal_values],
+            columns=state_columns + ['π*', 'V*']
+        )
+        return df
+
+    def save_training_results(self, filename):
+        np.save(filename+'_Qtable.npy', self.Qtable)
+        np.save(filename+'_Visits.npy', self.visits)
+
+    def load_training_results(self, filename):
+        self.Qtable = np.load(filename+'_Qtable.npy')
+        self.visits = np.load(filename+'_Visits.npy')
+        self.get_optimal_values()
+        self.get_optimal_policy()
