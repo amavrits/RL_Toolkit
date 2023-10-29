@@ -212,10 +212,10 @@ class DeepQLearning:
         if self.fit_transforming:
             state = self.fit_transformer.state_transformation(state)
             values = self.policy_net(state)
-            values = self.fit_transformer.value_detransformation(values)
+            values = self.fit_transformer.value_detransformation(values).reshape(values.shape)
         else:
-            values = self.policy_net(state)
-        action = values.max(1)[1].detach().numpy().squeeze()
+            values = self.policy_net(state).detach().numpy()
+        action = values.argmax(axis=1).squeeze()
         return action
 
     def get_optimal_value(self, state):
@@ -224,22 +224,28 @@ class DeepQLearning:
         if self.fit_transforming:
             state = self.fit_transformer.state_transformation(state)
             values = self.policy_net(state)
-            values = self.fit_transformer.value_detransformation(values)
+            values = self.fit_transformer.value_detransformation(values).reshape(values.shape)
         else:
-            values = self.policy_net(state)
-        return values.detach().numpy().squeeze()
+            values = self.policy_net(state).detach().numpy()
+        return values.squeeze()
 
     def save_training_results(self, filename):
         filehandler = open(filename+'_Replay', 'wb')
         pickle.dump(self.replay, filehandler)
         torch.save(self.policy_net.state_dict(), filename+'_PolicyNet')
         torch.save(self.target_net.state_dict(), filename+'_TargetNet')
+        if self.fit_transforming:
+            filehandler = open(filename + '_Transformer', 'wb')
+            self.fit_transformer.save_transformer(filehandler)
 
     def load_training_results(self, filename):
         filehandler = open(filename+'_Replay', 'rb')
         self.replay = pickle.load(filehandler)
         self.policy_net.load_state_dict(torch.load(filename+'_PolicyNet'))
         self.target_net.load_state_dict(torch.load(filename+'_TargetNet'))
+        if self.fit_transforming:
+            filehandler = open(filename + '_Transformer', 'rb')
+            self.fit_transformer.load_transformer(filehandler)
 
     def init_fig(self):
         self.fig, self.axs = plt.subplots(2)
