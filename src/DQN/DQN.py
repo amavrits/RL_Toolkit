@@ -74,19 +74,19 @@ class DeepQLearning:
         transitions = self.replay.sample(self.batch_size)
         batch = Transition(*zip(*transitions))
 
-        # Compute a mask of non-final states and concatenate the batch elements
-        # (a final state would've been the one after which simulation ended)
-        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)),
-                                      device=self.device, dtype=torch.bool)
-        non_final_next_states = torch.cat([s for s in batch.next_state if s is not None])
-
         state_batch = torch.cat(batch.state)
         action_batch = torch.cat(batch.action)
         reward_batch = torch.cat(batch.reward)
 
-        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the columns of actions taken.
-        # These are the actions which would've been taken for each batch state according to policy_net
-        state_action_values = self.policy_net(state_batch).gather(1, action_batch).squeeze()
+        # Compute a mask of non-final states and concatenate the batch elements
+        # (a final state would've been the one after which simulation ended)
+        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)),
+                                      device=self.device, dtype=torch.bool)
+        non_final_next_state_batch = torch.cat([s for s in batch.next_state if s is not None])
+
+        if self.fit_transforming:
+            state_batch = self.fit_transformer.state_transformation(state_batch)
+            non_final_next_state_batch = self.fit_transformer.state_transformation(non_final_next_state_batch)
 
         # Compute V(s_{t+1}) for all next states.
         # Expected values of actions for non_final_next_states are computed based
@@ -95,29 +95,68 @@ class DeepQLearning:
         # state value or 0 in case the state was final.
         next_state_values = torch.zeros(self.batch_size, device=self.device)
         with torch.no_grad():
-            next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0]
-
-        # Compute the expected Q values
+            next_state_values[non_final_mask] = self.target_net(non_final_next_state_batch).max(1)[0]
         expected_state_action_values = (next_state_values * self.gamma) + reward_batch.squeeze()
 
-        loss = self.loss_criterion(state_action_values, expected_state_action_values)
+        ''' REMOVE?
+        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the columns of actions taken.
+        # These are the actions which would've been taken for each batch state according to policy_net
+        state_action_values = self.policy_net(state_batch).gather(1, action_batch).squeeze()
 
-        # Optimize the model
         self.optimizer.zero_grad()
+        loss = self.loss_criterion(state_action_values, expected_state_action_values)
         loss.backward()
-
-        # In-place gradient clipping
         if self.clip:
             torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
         self.optimizer.step()
+        '''
 
-    def train(self, loss_criterion, optimizer, n_episodes=1_000, batch_size=128, tau=0.05, n_update=100, verbose=True, clip=True):
+        if self.fit_transforming:
+            expected_state_action_values = self.fit_transformer.value_transformation(expected_state_action_values)
 
+        # Optimize the model
+        for epoch in range(1, self.n_epochs + 1):
+            self.optimizer.zero_grad()
+            state_action_values = self.policy_net(state_batch).gather(1, action_batch).squeeze()
+            loss = self.loss_criterion(state_action_values, expected_state_action_values)
+            loss.backward()
+            if self.clip:
+                torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
+            self.optimizer.step()
+
+    def set_train_params(self, loss_criterion, optimizer, batch_size, tau, n_epochs=1, fit_transformer=None, clip=True):
         self.loss_criterion = loss_criterion
         self.optimizer = optimizer
+        self.fit_transforming = fit_transformer is not None
+        if self.fit_transforming: self.fit_transformer = fit_transformer
         self.batch_size = batch_size
+        self.n_epochs = n_epochs
         self.tau = tau
         self.clip = clip
+
+    def train(
+            self,
+            loss_criterion,
+            optimizer,
+            n_episodes,
+            batch_size,
+            n_epochs=1,
+            tau=0.05,
+            n_steps_update=100,
+            fit_transformer=None,
+            verbose=True,
+            clip=True
+    ):
+
+        self.set_train_params(
+            loss_criterion=loss_criterion,
+            optimizer=optimizer,
+            fit_transformer=fit_transformer,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            tau=tau,
+            clip=clip
+        )
 
         self.eps = self.eps_fn(0)
 
@@ -149,9 +188,11 @@ class DeepQLearning:
 
                 state = next_state
 
+                ''' REMOVE?
                 if (i_episode + t) % n_update == 0:
                     self.update_policynet()
                     self.update_targetnet()
+                '''
 
                 if done:
                     self.incerement_cnts(action, reward, t)
@@ -159,19 +200,34 @@ class DeepQLearning:
                         self.update_plot()
                     break
 
+            if i_episode % n_steps_update == 0:
+                self.update_policynet()
+                self.update_targetnet()
+
         print('Complete')
 
     def get_optimal_action(self, state):
-        state = self.transfer_to_tensor(state).squeeze()
-        action = self.policy_net(state).max(1)[1]
-        action = action.detach().numpy().squeeze()
+        if not torch.is_tensor(state):
+            state = self.transfer_to_tensor(state).squeeze()
+        if self.fit_transforming:
+            state = self.fit_transformer.state_transformation(state)
+            values = self.policy_net(state)
+            values = self.fit_transformer.value_detransformation(values)
+        else:
+            values = self.policy_net(state)
+        action = values.max(1)[1].detach().numpy().squeeze()
         return action
 
     def get_optimal_value(self, state):
-        state = self.transfer_to_tensor(state).squeeze()
-        value = self.policy_net(state).max(1)[0]
-        value = value.detach().numpy().squeeze()
-        return value
+        if not torch.is_tensor(state):
+            state = self.transfer_to_tensor(state).squeeze()
+        if self.fit_transforming:
+            state = self.fit_transformer.state_transformation(state)
+            values = self.policy_net(state)
+            values = self.fit_transformer.value_detransformation(values)
+        else:
+            values = self.policy_net(state)
+        return values.detach().numpy().squeeze()
 
     def save_training_results(self, filename):
         filehandler = open(filename+'_Replay', 'wb')
@@ -188,7 +244,7 @@ class DeepQLearning:
     def init_fig(self):
         self.fig, self.axs = plt.subplots(2)
 
-    def update_plot(self):
+    def update_plot(self, n_running_mean=100):
 
         self.axs[0].clear()
         self.axs[1].clear()
@@ -199,13 +255,13 @@ class DeepQLearning:
         self.axs[0].plot(durations_t.numpy(), c='b')
         self.axs[1].plot(rewards_t.numpy(), c='b')
 
-        if len(rewards_t) >= 100:
-            means = durations_t.unfold(0, 100, 1).mean(1).view(-1)
-            means = torch.cat((torch.zeros(99), means))
+        if len(rewards_t) >= n_running_mean:
+            means = durations_t.unfold(0, n_running_mean, 1).mean(1).view(-1)
+            means = torch.cat((torch.zeros(n_running_mean-1), means))
             self.axs[0].plot(means.numpy(), c='r')
 
-            means = rewards_t.unfold(0, 100, 1).mean(1).view(-1)
-            means = torch.cat((torch.zeros(99), means))
+            means = rewards_t.unfold(0, n_running_mean, 1).mean(1).view(-1)
+            means = torch.cat((torch.zeros(n_running_mean-1), means))
             self.axs[1].plot(means.numpy(), c='r')
 
         self.axs[1].set_xlabel('Episode')
