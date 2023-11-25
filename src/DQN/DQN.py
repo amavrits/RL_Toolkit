@@ -19,8 +19,7 @@ class DeepQLearning:
     def __init__(self, env, gamma, eps_fn, n_replay=1e5):
 
         self.env = env
-        self.n_states = self.env.state_mesh.shape[0]
-        self.state_size = self.env.state_mesh.shape[1]
+        self.state_size = len(self.env.observation_space)
         self.n_actions = self.env.action_space.n
 
         self.n_replay = n_replay
@@ -33,19 +32,27 @@ class DeepQLearning:
         if n_replay is None: n_replay = self.n_replay
         self.replay = ReplayMemory(int(n_replay))
 
-    def init_nn_models(self, nn_model):
+    def read_nn_models(self, policy_net, target_net):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.policy_net = nn_model(self.state_size, self.n_actions).to(self.device)
-        self.target_net = nn_model(self.state_size, self.n_actions).to(self.device)
+        self.policy_net = policy_net.to(self.device)
+        self.target_net = target_net.to(self.device)
 
     def pick_action(self, state):
-        sample = random.random()
-        if sample > self.eps:
-            if self.fit_transforming: state = self.fit_transformer.state_transformation(state)
-            with torch.no_grad():
-                action = self.policy_net(state).max(1)[1].view(1, 1)
+
+        if self.forbid_actions_fn is None:
+            allowed_actions = np.arange(self.env.action_space.n)
         else:
-            action = torch.tensor([[self.env.action_space.sample()]], device=self.device, dtype=torch.long)
+            allowed_actions = self.forbid_actions_fn(state.detach().numpy().squeeze(), self.env)
+
+        sample = random.random()
+
+        if sample > self.eps:
+            if self.fit_transforming:
+                state = self.fit_transformer.state_transformation(state)
+            with torch.no_grad():
+                action = self.policy_net(state)[:, allowed_actions].max(1)[1].view(1, 1)
+        else:
+            action = torch.tensor([[np.random.choice(allowed_actions)]], device=self.device, dtype=torch.long)
         return action
 
     def transfer_to_tensor(self, x, dtype=torch.float):
@@ -69,10 +76,7 @@ class DeepQLearning:
                                          target_net_state_dict[key] * (1 - self.tau)
         self.target_net.load_state_dict(target_net_state_dict)
 
-    def update_policynet(self):
-
-        if len(self.replay) < self.batch_size:
-            return
+    def get_batches(self):
 
         transitions = self.replay.sample(self.batch_size)
         batch = Transition(*zip(*transitions))
@@ -89,9 +93,9 @@ class DeepQLearning:
                                       device=self.device, dtype=torch.bool)
         non_final_next_state_batch = torch.cat([s for s in batch.next_state if s is not None])
 
-        if self.fit_transforming:
-            state_batch = self.fit_transformer.state_transformation(state_batch)
-            non_final_next_state_batch = self.fit_transformer.state_transformation(non_final_next_state_batch)
+        return (state_batch, action_batch, reward_batch, non_final_next_state_batch, non_final_mask)
+
+    def get_batch_values(self, non_final_mask, non_final_next_state_batch, reward_batch):
 
         '''
         Compute V(s_{t+1}) for all next states.
@@ -105,8 +109,24 @@ class DeepQLearning:
             next_state_values[non_final_mask] = self.target_net(non_final_next_state_batch).max(1)[0]
         expected_state_action_values = (next_state_values * self.gamma) + reward_batch.squeeze()
 
+        return expected_state_action_values.type(torch.float32)
+
+    def update_policynet(self):
+
+        if len(self.replay) < self.batch_size:
+            return
+
+        state_batch, action_batch, reward_batch, non_final_next_state_batch, non_final_mask = self.get_batches()
+
         if self.fit_transforming:
-            expected_state_action_values = self.fit_transformer.value_transformation(expected_state_action_values)
+            state_batch = self.fit_transformer.state_transformation(state_batch)
+            non_final_next_state_batch = self.fit_transformer.state_transformation(non_final_next_state_batch)
+            reward_batch = self.fit_transformer.value_transformation(reward_batch)
+
+        expected_state_action_values = self.get_batch_values(non_final_mask, non_final_next_state_batch, reward_batch)
+
+        # if self.fit_transforming:
+        #     expected_state_action_values = self.fit_transformer.value_transformation(expected_state_action_values)
 
         '''Optimize the model'''
         for epoch in range(1, self.n_epochs + 1):
@@ -120,85 +140,21 @@ class DeepQLearning:
 
             loss = self.loss_criterion(state_action_values, expected_state_action_values)
             loss.backward()
-            if self.clip:
-                torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
+            if self.clipping:
+                torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), self.clip)
             self.optimizer.step()
 
-
-    # def update_policynet(self):
-    #
-    #     if len(self.replay) < self.batch_size:
-    #         return
-    #
-    #     # transitions = self.replay.memory
-    #     transitions = self.replay.sample(self.batch_size)
-    #     batch = Transition(*zip(*transitions))
-    #
-    #     state_batch = torch.cat(batch.state)
-    #     action_batch = torch.cat(batch.action)
-    #     reward_batch = torch.cat(batch.reward)
-    #
-    #     non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)),
-    #                                   device=self.device, dtype=torch.bool)
-    #     non_final_next_state_batch = torch.cat([s for s in batch.next_state if s is not None])
-    #
-    #     if self.fit_transforming:
-    #     #     state_batch = self.fit_transformer.state_transformation(state_batch)
-    #     #     non_final_next_state_batch = self.fit_transformer.state_transformation(non_final_next_state_batch)
-    #         reward_batch = self.fit_transformer.value_transformation(reward_batch)
-    #
-    #     next_state_values = torch.zeros(state_batch.shape[0], device=self.device)
-    #     with torch.no_grad():
-    #         next_state_values[non_final_mask] = self.target_net(non_final_next_state_batch).max(1)[0]
-    #     expected_state_action_values = (next_state_values * self.gamma) + reward_batch.squeeze()
-    #
-    #     # Q_table_true = np.load('dummy.npy')
-    #     Q_table_true = np.load('dummy2.npy')
-    #     Q_table_true = self.fit_transformer.value_transformation(Q_table_true)
-    #     next_state_values = torch.zeros(state_batch.shape[0], device=self.device)
-    #     idx = np.zeros(non_final_next_state_batch.shape[0])
-    #     for i, non_final_next_state in enumerate(non_final_next_state_batch):
-    #         non_final_next_state = non_final_next_state.detach().numpy()
-    #         ii = np.argmin(np.abs(self.env.beta_grid-non_final_next_state[0]))
-    #         idx[i] = ii * 4 + non_final_next_state[3] + 2 * non_final_next_state[2]
-    #     next_state_values[non_final_mask] = Q_table_true[idx.astype(int)].squeeze().max(1)[0]
-    #     expected_state_action_values = (next_state_values * self.gamma) + reward_batch.squeeze()
-    #
-    #     action_batch = action_batch[state_batch[:, 0] < 1]
-    #     expected_state_action_values = expected_state_action_values[state_batch[:, 0] < 1]
-    #     state_batch = state_batch[state_batch[:, 0] < 1]
-    #
-    #     state_batch = self.fit_transformer.state_transformation(state_batch)
-    #     state_batch = torch.tensor(state_batch.detach().numpy(), dtype=torch.float32)
-    #     expected_state_action_values = torch.tensor(expected_state_action_values.detach().numpy(), dtype=torch.float32)
-    #
-    #     # Optimize the model
-    #     # for epoch in range(1, self.n_epochs + 1):
-    #     self.optimizer.zero_grad()
-    #     state_action_values = self.policy_net(state_batch).gather(1, action_batch).squeeze()
-    #     loss = self.loss_criterion(state_action_values, expected_state_action_values)
-    #     loss.backward()
-    #     if self.clip:
-    #         torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
-    #     self.optimizer.step()
-    #
-    #
-    #     # import matplotlib.pyplot as plt
-    #     # state_action_values = self.policy_net(state_batch).gather(1, action_batch).squeeze()
-    #     # plt.scatter(state_action_values.detach().numpy(), expected_state_action_values.detach().numpy())
-    #     # plt.plot([expected_state_action_values.min(), expected_state_action_values.max()], [expected_state_action_values.min(), expected_state_action_values.max()], c='k')
-    #
-    #     # print()
-
-    def set_train_params(self, loss_criterion, optimizer, batch_size, fit_transformer=None, clip=True):
+    def set_train_params(self, loss_criterion, optimizer, batch_size, fit_transformer=None, forbid_actions_fn=None, clip=100):
         self.loss_criterion = loss_criterion
         self.optimizer = optimizer
         self.fit_transforming = fit_transformer is not None
         if self.fit_transforming: self.fit_transformer = fit_transformer
+        self.forbid_actions_fn = forbid_actions_fn
         self.batch_size = batch_size
-        self.clip = clip
+        self.clipping = clip is not None
+        if self.clipping: self.clip = clip
 
-    def train(self, n_episodes, n_epochs=1, tau=0.05, n_steps_update=100, verbose=True):
+    def train(self, n_episodes, n_epochs=1, tau=0.05, n_steps_update=100, verbose=True, n_running_mean=100):
 
         self.n_epochs = n_epochs
         self.tau = tau
@@ -238,14 +194,15 @@ class DeepQLearning:
 
                 state = next_state
 
+                self.update_policynet()
+
                 if step_cnt % n_steps_update == 0:
-                    self.update_policynet()
                     self.update_targetnet()
 
                 if done:
-                    self.incerement_cnts(action, reward, t)
+                    self.incerement_cnts(action, reward.item(), t)
                     if verbose:
-                        self.update_plot()
+                        self.update_plot(n_running_mean=n_running_mean)
                     break
 
     def get_values(self, state):
@@ -299,12 +256,12 @@ class DeepQLearning:
 
         if len(rewards_t) >= n_running_mean:
             means = durations_t.unfold(0, n_running_mean, 1).mean(1).view(-1)
-            means = torch.cat((torch.zeros(n_running_mean-1), means))
-            self.axs[0].plot(means.numpy(), c='r')
+            means = torch.cat((torch.zeros(n_running_mean-1), means)).detach().numpy().squeeze()
+            self.axs[0].plot(means, c='r')
 
             means = rewards_t.unfold(0, n_running_mean, 1).mean(1).view(-1)
-            means = torch.cat((torch.zeros(n_running_mean-1), means))
-            self.axs[1].plot(means.numpy(), c='r')
+            means = torch.cat((torch.zeros(n_running_mean-1), means)).detach().numpy().squeeze()
+            self.axs[1].plot(means, c='r')
 
         self.axs[1].set_xlabel('Episode')
         self.axs[0].set_ylabel('Duration [steps]')

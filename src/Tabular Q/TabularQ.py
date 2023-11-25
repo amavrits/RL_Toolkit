@@ -1,6 +1,11 @@
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from itertools import count
+
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
 
 class TabularQLearning:
 
@@ -24,11 +29,20 @@ class TabularQLearning:
     def update_visits(self, state_idx, action):
         self.visits[state_idx, action] += 1
 
-    def pick_action(self, state_idx):
-        if np.random.uniform(0, 1) < self.eps:
-            action = np.random.choice(np.arange(self.n_actions))
+    def pick_action(self, state):
+
+        state_idx = self.env.get_observation_idx(state)
+
+        if self.forbid_actions_fn is None:
+            allowed_actions = np.arange(self.env.action_space.n)
         else:
-            action = np.argmax(self.Qtable[state_idx])
+            allowed_actions = self.forbid_actions_fn(state, self.env)
+
+        if np.random.uniform(0, 1) < self.eps:
+            action = np.random.choice(allowed_actions)
+        else:
+            action = np.argmax(self.Qtable[state_idx, allowed_actions])
+
         return action
 
     def get_next_state(self, next_state, terminated):
@@ -45,11 +59,20 @@ class TabularQLearning:
         new_value = (1 - self.alpha) * old_value + self.alpha * (reward + self.gamma * next_value)
         self.Qtable[state_idx, action] = new_value
 
-    def train(self, n_episodes=1_000):
+    def train(self, n_episodes=1_000, forbid_actions_fn=None, verbose=True):
 
         self.reset_Qtable()
+
         self.reset_visits()
+
         self.eps = self.eps_fn(0)
+
+        self.forbid_actions_fn = forbid_actions_fn
+
+        if verbose:
+            self.init_fig()
+
+        self.init_cnts()
 
         for i_episode in tqdm(range(1, n_episodes + 1)):
 
@@ -57,15 +80,16 @@ class TabularQLearning:
 
             state, _ = self.env.reset()
 
-            done = False
-
-            while not done:
+            for t in count():
 
                 state_idx = self.env.get_observation_idx(state)
 
-                self.alpha = self.alpha_fn(state)
+                self.alpha = self.alpha_fn(state, i_episode)
 
-                action = self.pick_action(state_idx)
+                action = self.pick_action(state)
+
+                if state[0] <= 8 and action == 2:
+                    print()
 
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
 
@@ -79,7 +103,14 @@ class TabularQLearning:
 
                 state = next_state
 
+                if done:
+                    self.incerement_cnts(action, reward, t)
+                    if verbose:
+                        self.update_plot()
+                    break
+
         self.get_optimal_values()
+
         self.get_optimal_policy()
 
     def get_Qtable(self):
@@ -114,3 +145,41 @@ class TabularQLearning:
         self.visits = np.load(filename+'_Visits.npy')
         self.get_optimal_values()
         self.get_optimal_policy()
+
+    def init_cnts(self):
+        self.episode_actions = []
+        self.episode_durations = []
+        self.episode_rewards = []
+
+    def incerement_cnts(self, action, reward, t):
+        self.episode_actions.append(action)
+        self.episode_durations.append(t + 1)
+        self.episode_rewards.append(reward)
+
+    def init_fig(self):
+        self.fig, self.axs = plt.subplots(2)
+
+    def update_plot(self, n_running_mean=100):
+
+        self.axs[0].clear()
+        self.axs[1].clear()
+
+        rewards_t = np.array(self.episode_rewards)
+        durations_t = np.array(self.episode_durations)
+
+        self.axs[0].plot(durations_t, c='b')
+        self.axs[1].plot(rewards_t, c='b')
+
+        if len(rewards_t) >= n_running_mean:
+            means = durations_t[-n_running_mean:].mean()
+            self.axs[0].plot(means, c='r')
+
+            means = rewards_t[-n_running_mean:].mean()
+            self.axs[1].plot(means, c='r')
+
+        self.axs[1].set_xlabel('Episode')
+        self.axs[0].set_ylabel('Duration [steps]')
+        self.axs[1].set_ylabel('Reward')
+
+        plt.draw()
+        plt.pause(0.001)
